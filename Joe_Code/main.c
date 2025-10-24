@@ -8,7 +8,7 @@
 #include <math.h>
 
 typedef struct{
-    uint8_t preamble[4];
+    uint8_t preamble[8];
     uint16_t sequence;
     uint8_t length;
     uint8_t payload[253];
@@ -59,7 +59,7 @@ static void build_CRC16_table(){
 
 uint16_t CRC16(Packet pkt){
     uint16_t crc = 0xFFFF;
-    for(int i = 0; i < sizeof(pkt.length); i++){
+    for(int i = 0; i < pkt.length; i++){
         uint8_t idx = (uint8_t)(((crc >> 8) & 0xFF)^pkt.payload[i]);
         crc = (uint16_t)((crc << 8) ^ CRC16_table[idx]);
     }
@@ -85,13 +85,13 @@ int byte_to_bits(uint8_t byte, bool* packet_bits, size_t bits_cap, size_t* bit_p
 }
 
 size_t packet_to_bits(const Packet *pkt, bool *packet_bits, size_t bits_cap ){
-    size_t need_bits = 32u + 16u + 8u + (size_t)pkt->length * 8u + 16u;
+    size_t need_bits = 64u + 16u + 8u + (size_t)pkt->length * 8u + 16u;
     if(bits_cap < need_bits){
         return 0;
     }
     size_t bit_pos = 0;
     int rc;
-    for(int i = 0; i < 4; i++){
+    for(int i = 0; i < 8; i++){
         rc = byte_to_bits(pkt->preamble[i], packet_bits, bits_cap, &bit_pos);
         if(rc != 0){
             return 0;
@@ -145,40 +145,47 @@ int bits_to_float_bpsk_iq(bool *packet_bits, size_t num_bits, float* out_iq, int
     return (int)num_complex;
 } 
 
-static void rrc_generate_taps(float alpha, int sps, int span, float *taps_out){
-    int num_taps = span * sps;
-    int mid = num_taps/2;
-    double a = (double)alpha;
-    double T = 1.0;
-    double Ts = T/(double)sps;
-    double eps = 1e-12;
-    double sum = 0.0;
-    for(int n = 0; n < num_taps; n++){
-        int k = n - mid;
-        double t = k * Ts;
-        double x = 4.0 * a * t/T;
+static void rrc_generate_taps(float alpha, int sps, int span, float *taps_out)
+{
+    const int num_taps = span * sps + 1;     // odd length
+    const int mid      = num_taps / 2;
+    const double a     = (double)alpha;
+    const double T     = 1.0;                 // symbol period
+    const double Ts    = T / (double)sps;
+    const double eps   = 1e-12;
+
+    for (int n = 0; n < num_taps; n++) {
+        const int k   = n - mid;
+        const double t = k * Ts;              // time in symbol units
         double h;
-        if(fabs(t) < eps){
+
+        // t = 0 → closed form
+        if (fabs(t) < eps) {
             h = 1.0 + a * (4.0/M_PI - 1.0);
-        }else if(a > 0.0 && fabs(fabs(t) - T/(4.0*a)) < (2.0*Ts)){
-            double theta = M_PI/(4.0*a);
-            h = (a/sqrt(2.0)) * ((1.0 + 2.0/M_PI)*sin(theta) + (1.0 - 2.0/M_PI)*cos(theta));
-        }else{
-            double num1 = cos((1.0 + a)*M_PI*t/T);
-            double num2 = (T/(4.0*a*t)) * sin((1.0 - a)*M_PI*t/T);
-            double den1 = M_PI*t/T;
-            double den2 = 1.0 - x*x;
-            h = (4.0*a) * (num1 + num2)/(den1 * den2); 
+        }
+        // t = ±T/(4α) → closed form
+        else if (a > 0.0 && fabs(fabs(t) - T/(4.0*a)) < 1e-9) {
+            const double theta = M_PI/(4.0*a);
+            h = (a / sqrt(2.0)) * ((1.0 + 2.0/M_PI)*sin(theta) + (1.0 - 2.0/M_PI)*cos(theta));
+        }
+        // general case
+        else {
+            const double num = sin(M_PI * t * (1.0 - a) / T)
+                             + (4.0 * a * t / T) * cos(M_PI * t * (1.0 + a) / T);
+            const double den = (M_PI * t / T) * (1.0 - pow(4.0 * a * t / T, 2.0));
+            h = num / den;
         }
 
         taps_out[n] = (float)h;
-        sum += h*h; 
     }
-    double scale = (sum > 0.0) ? (1.0/sqrt(sum)) : 1.0;
-        for(int n = 0; n < num_taps; n++){
-            taps_out[n] = (float)(taps_out[n]*scale);
-        } 
+
+    // Normalize for unity energy (so TX+RX ≈ RC with unity peak)
+    double e = 0.0;
+    for (int n = 0; n < num_taps; n++) e += (double)taps_out[n] * (double)taps_out[n];
+    const double scale = (e > 0.0) ? 1.0 / sqrt(e) : 1.0;
+    for (int n = 0; n < num_taps; n++) taps_out[n] = (float)(taps_out[n] * scale);
 }
+
 
 static void iq_interleaved_fir_filter(float *x, size_t in_floats, float *h, int num_taps, float *y){
     size_t nin = in_floats/2;
@@ -202,7 +209,6 @@ static void iq_interleaved_fir_filter(float *x, size_t in_floats, float *h, int 
 }
 
 void tx_pulse_shape(float *out_iq, size_t nsamps_unshaped, int sps, float alpha, int span, float **shaped_out_iq, size_t *nsamps_shaped_out){
-    (void)sps;
     int num_taps = span * sps + 1;
     float *taps = (float*)malloc(sizeof(float)*num_taps);
     rrc_generate_taps(alpha, sps, span, taps);
@@ -251,20 +257,20 @@ void debugPrints(Packet pkt, bool *packet_bits, size_t num_bits, float *out_iq, 
     printf("\n");
     printf("Number of Bits: %d\n", num_bits);
     printf("\n");
-    printf("IQ Data (unfiltered): \n");
-    for(int i = 0; i < num_iq_samps; i++){
-        int idx = 2 * i; 
-        printf("%+.1f, %+.1f | ", out_iq[idx], out_iq[idx + 1]);
-    }
-    printf("\n");
+    //printf("IQ Data (unfiltered): \n");
+    //for(int i = 0; i < num_iq_samps; i++){
+    //    int idx = 2 * i; 
+    //    printf("%+.1f, %+.1f | ", out_iq[idx], out_iq[idx + 1]);
+    //}
+    //printf("\n");
     printf("Number of IQ Samples: %d\n", num_iq_samps);
     printf("\n");
-    printf("Shaped IQ Data: \n");
-    for(size_t i = 0; i < shaped_out_iq_length/2; i++){
-        int idx = 2 * i; 
-        printf("%+.1f, %+.1f | ", shaped_out_iq[idx], shaped_out_iq[idx + 1]);
-    }
-    printf("\n");
+    //printf("Shaped IQ Data: \n");
+    //for(size_t i = 0; i < shaped_out_iq_length/2; i++){
+    //    int idx = 2 * i; 
+    //    printf("%+.1f, %+.1f | ", shaped_out_iq[idx], shaped_out_iq[idx + 1]);
+    //}
+    //printf("\n");
     printf("Shaped IQ size: %zu\n", shaped_out_iq_length);
 }
 
@@ -273,48 +279,97 @@ void write_cf32(FILE *file, float *shaped_out_iq, size_t shaped_out_iq_length){
     printf("Wrote cf32 IQ to file.\n");
 }
 
-int main(){
+int main(void){
     printf("Hello World\n");
-    const char* in_path = "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\hello.txt";
-    const char* out_path = "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\goodbye.cfile";
-    FILE* inputFile = OpenFile(in_path, true);
-    FILE* outputFile = OpenFile(out_path, false); 
-    Packet pkt;
-    uint8_t preamble[4] = {0xAA, 0xAA, 0xAA, 0xAA};
-    uint16_t sequence = 0;
-    build_CRC16_table();
-    if(crc_table_built){
-        printf("CRC Table Built\n");
-    }else{
-        printf("CRC Table Error\n");
+
+    const char* in_path  = "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\hello.txt";
+    const char* out_path = "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\goodbye.cfile";
+
+    FILE* inputFile  = OpenFile(in_path,  true);
+    FILE* outputFile = OpenFile(out_path, false);
+    if (!inputFile || !outputFile) {
+        if (inputFile)  fclose(inputFile);
+        if (outputFile) fclose(outputFile);
+        return 1;
     }
 
-    while ((fread(pkt.payload, 1, sizeof(pkt.payload), inputFile)) > 0){
+    build_CRC16_table();
+    printf("%s\n", crc_table_built ? "CRC Table Built" : "CRC Table Error");
+
+    Packet pkt;
+    const uint8_t preamble[8] = {0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xD5};
+    uint16_t sequence = 0;
+
+    // TX params
+    const int   sps   = 8;
+    const float alpha = 0.5f;
+    const int   span  = 11;
+
+    for (;;) {
+        // Read up to 253 bytes from the input file
+        size_t nread = fread(pkt.payload, 1, sizeof(pkt.payload), inputFile);
+        if (nread == 0) break;
+
+        // Fill packet fields for this block
         memcpy(pkt.preamble, preamble, sizeof(pkt.preamble));
-        pkt.sequence = sequence;
-        pkt.length = sizeof(pkt.payload);
-        sequence++;
+        pkt.sequence = sequence++;
+        pkt.length   = (uint8_t)nread;
+
+        // Compute CRC over actual payload length
         pkt.crc = CRC16(pkt);
-        bool packet_bits[2096];
-        size_t num_bits = packet_to_bits(&pkt, packet_bits, 2096);
-        int sps = 8;
-        float out_iq[2*num_bits*sps];
+
+        // ---- Build bitstream (compute exact bit budget) ----
+        const size_t need_bits =
+            8u*sizeof(pkt.preamble) +   // preamble (8 bytes -> 64 bits)
+            16u +                        // sequence (2 bytes)
+            8u  +                        // length   (1 byte)
+            (size_t)pkt.length * 8u +    // payload
+            16u;                         // CRC (2 bytes)
+
+        bool *packet_bits = (bool*)malloc(need_bits * sizeof(bool));
+        if (!packet_bits) {
+            fprintf(stderr, "malloc failed for packet_bits (%zu bits)\n", need_bits);
+            break;
+        }
+
+        size_t num_bits = packet_to_bits(&pkt, packet_bits, need_bits);
+
+        // Debug dump (optional)
+        debugPrints(pkt, packet_bits, (int)num_bits, NULL, 0, NULL, 0);
+
+        if (num_bits == 0) {
+            // Nothing to send for this packet; clean up and continue
+            free(packet_bits);
+            continue;
+        }
+
+        // ---- Map bits to BPSK (I-axis) ----
+        size_t out_iq_floats = 2u * (size_t)num_bits * (size_t)sps; // I/Q interleaved
+        float *out_iq = (float*)malloc(out_iq_floats * sizeof(float));
+        if (!out_iq) {
+            fprintf(stderr, "malloc failed for out_iq (%zu floats)\n", out_iq_floats);
+            free(packet_bits);
+            break;
+        }
+
         int num_iq_samps = bits_to_float_bpsk_iq(packet_bits, num_bits, out_iq, sps);
+        printf("Number of Bits: %zu\n", num_bits);
+        printf("Number of IQ Samples: %d\n\n", num_iq_samps);
 
-        float alpha = 0.22f;
-        int span = 11;
-
+        // ---- RRC pulse shaping ----
         float *shaped_out_iq = NULL;
         size_t shaped_out_iq_length = 0;
+        if (num_iq_samps > 0) {
+            tx_pulse_shape(out_iq, 2*(size_t)num_iq_samps, sps, alpha, span,
+                           &shaped_out_iq, &shaped_out_iq_length);
+            printf("Shaped IQ size: %zu\n", shaped_out_iq_length);
+            write_cf32(outputFile, shaped_out_iq, shaped_out_iq_length);
+        }
 
-        tx_pulse_shape(out_iq, 2*(size_t)num_iq_samps, sps, alpha, span, &shaped_out_iq, &shaped_out_iq_length);
-
-
-        debugPrints(pkt, packet_bits, num_bits, out_iq, num_iq_samps, shaped_out_iq, shaped_out_iq_length);
-        
-        write_cf32(outputFile, shaped_out_iq, shaped_out_iq_length);
-
+        // Cleanup
         free(shaped_out_iq);
+        free(out_iq);
+        free(packet_bits);
     }
 
     fclose(inputFile);
