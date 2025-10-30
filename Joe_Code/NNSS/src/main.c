@@ -1,28 +1,22 @@
 #include "api.h"
 
-/* Defaults (your originals for TX) */
+/* Defaults (unchanged) */
 #define DEFAULT_TX_IN  "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\NNSS\\data\\hello.txt"
 #define DEFAULT_TX_OUT "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\NNSS\\data\\goodbye.cfile"
-
-/* RX sensible defaults (use TX output as RX input, write a new file) */
-#define DEFAULT_RX_IN  "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\NNSS\\data\\goodbye.cfile"
+#define DEFAULT_RX_IN  "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\NNSS\\data\\goodbye_offset.cfile"
 #define DEFAULT_RX_OUT "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\NNSS\\data\\rx_out.cfile"
-
-static void usage_tx(const char *p);
 
 static void usage_tx(const char *p){
     fprintf(stderr, "Usage (TX): %s --mode tx [--in path] [--out path]\n", p);
 }
-
 static void usage_rx(const char *p){
     fprintf(stderr, "Usage (RX): %s --mode rx [--in path] [--out path] "
                     "[--sps N] [--span K] [--alpha A] [--L P] "
                     "[--loopbw BW] [--damp ZETA] [--orelim R] "
+                    "[--fll_bw B] [--be_frac R] "
                     "[--noagc] [--notrim] [--quiet]\n", p);
 }
 
-
-/* Small helpers so we can use flags for in/out too */
 static const char* get_opt_str(int argc, char **argv, const char *key, const char *defv){
     for (int i = 1; i+1 < argc; i++) if (strcmp(argv[i], key) == 0) return argv[i+1];
     return defv;
@@ -37,6 +31,7 @@ int main(int argc, char **argv){
     const char *mode = get_opt(argc, argv, "--mode", "");
 
     if (strcmp(mode, "tx") == 0){
+       
         /* ----- TX PATH (defaults preserved) ----- */
         const char* in_path  = get_opt_str(argc, argv, "--in",  DEFAULT_TX_IN);
         const char* out_path = get_opt_str(argc, argv, "--out", DEFAULT_TX_OUT);
@@ -68,7 +63,7 @@ int main(int argc, char **argv){
             pkt.crc      = CRC16(pkt);
 
             const size_t need_bits = 8u*sizeof(pkt.preamble) + 16u + 8u +
-                                     (size_t)pkt.length * 8u + 16u;
+                                        (size_t)pkt.length * 8u + 16u;
             bool *packet_bits = (bool*)malloc(need_bits * sizeof(bool));
             if (!packet_bits){ fprintf(stderr, "malloc packet_bits failed\n"); break; }
 
@@ -101,9 +96,10 @@ int main(int argc, char **argv){
         fclose(inputFile); fclose(outputFile);
         return 0;
     }
+        
 
     if (strcmp(mode, "rx") == 0){
-        /* ----- RX PATH (defaults aligned to your TX output) ----- */
+        /* ----- RX PATH ----- */
         const char *in_path  = get_opt_str(argc, argv, "--in",  DEFAULT_RX_IN);
         const char *out_path = get_opt_str(argc, argv, "--out", DEFAULT_RX_OUT);
 
@@ -114,6 +110,10 @@ int main(int argc, char **argv){
         double LOOPBW  = atof(get_opt(argc, argv, "--loopbw",  "0.0628"));
         double DAMP    = atof(get_opt(argc, argv, "--damp",    "0.707"));
         double ORELIM  = atof(get_opt(argc, argv, "--orelim",  "0.375"));
+
+        /* FLL tuning (optional CLI) */
+        double FLL_BW  = atof(get_opt(argc, argv, "--fll_bw",  "0.004"));  /* per-sample */
+        float  BE_FRAC = (float)atof(get_opt(argc, argv, "--be_frac", "1.0"));
 
         int do_agc  = flag_present(argc, argv, "--noagc")  ? 0 : 1;
         int do_trim = flag_present(argc, argv, "--notrim") ? 0 : 1;
@@ -134,23 +134,54 @@ int main(int argc, char **argv){
         fclose(fi);
         if (rd != nfloats){ fprintf(stderr,"short read\n"); free(xIQ); return 1; }
 
+        /* --- AGC (optional) --- */
         if (do_agc){
-            StreamAGC *agc = agc_create(1e-3, 1e-3, 1.0, 1.0);
-            if (!agc){ fprintf(stderr,"AGC alloc failed\n"); free(xIQ); return 1; }
-            agc_bootstrap(agc, xIQ, nin_c, 1000);
+            StreamAGC *agc = agc_create(/*beta*/1e-3, /*gamma*/2.0, /*target_rms*/0.5, /*init_gain*/1.0);
+            if (!agc){ fprintf(stderr,"agc_create failed\n"); free(xIQ); return 1; }
+            agc_bootstrap(agc, xIQ, nin_c, (size_t)(8*SPS));
             agc_apply_inplace(agc, xIQ, nin_c);
             agc_free(agc);
+            if (!quiet) fprintf(stderr,"AGC applied.\n");
         }
 
+        /* --- FLL Band-Edge (diagnostic output + feed PFB) --- */
+        FLLBandEdge *fll = fll_be_create(ALPHA, SPS, SPAN, BE_FRAC, FLL_BW, /*damping*/0.707, /*pwr_beta*/0.0015, quiet?0:1);
+        if (!fll){ fprintf(stderr,"fll_be_create failed\n"); free(xIQ); return 1; }
+
+        float *xIQ_corr = (float*)malloc(sizeof(float) * 2 * nin_c);
+        if (!xIQ_corr){ fprintf(stderr,"malloc xIQ_corr failed\n"); fll_be_free(fll); free(xIQ); return 1; }
+
+        size_t nfix = fll_be_process(fll, xIQ, nin_c, xIQ_corr);
+        if (nfix != nin_c) { fprintf(stderr,"fll_be_process wrote %zu of %zu\n", nfix, nin_c); }
+
+        if (!quiet){
+            const char *fll_out_path = "C:\\Users\\joebo\\OneDrive\\Desktop\\Scalable\\SENIOR-DESIGN-NNSS\\Joe_Code\\NNSS\\data\\fll_corrected.cfile";
+            FILE *fll_out = fopen(fll_out_path, "wb");
+            if (fll_out) {
+                size_t fll_wr = fwrite(xIQ_corr, sizeof(float), 2*nfix, fll_out);
+                fclose(fll_out);
+                printf("Wrote %zu complex samples to: %s\n", nfix, fll_out_path);
+            } else {
+                fprintf(stderr, "Warning: could not write FLL output file\n");
+            }
+            printf("FLL: est freq = %.6g cps (%.6g rad/spl)\n",
+                   fll_be_get_freq_cps(fll), fll_be_get_freq_rad(fll));
+        }
+
+        /* Replace input with corrected for downstream timing recovery */
+        free(xIQ); xIQ = xIQ_corr; nin_c = nfix;
+
+        /* --- PFB timing recovery (use your existing settings) --- */
         PFBClockSync *cs = pfbcs_create(ALPHA, SPS, SPAN, L, LOOPBW, DAMP, ORELIM,
                                         /*enable_agc=*/0, /*agc_rate=*/0.0,
                                         quiet ? 0 : 1);
-        if (!cs){ fprintf(stderr,"pfbcs_create failed\n"); free(xIQ); return 1; }
+        if (!cs){ fprintf(stderr,"pfbcs_create failed\n"); fll_be_free(fll); free(xIQ); return 1; }
 
         float *yIQ = (float*)malloc(sizeof(float) * 2 * nin_c);
-        if (!yIQ){ fprintf(stderr,"malloc yIQ failed\n"); pfbcs_free(cs); free(xIQ); return 1; }
+        if (!yIQ){ fprintf(stderr,"malloc yIQ failed\n"); pfbcs_free(cs); fll_be_free(fll); free(xIQ); return 1; }
         size_t nout = pfbcs_process(cs, xIQ, nin_c, yIQ);
 
+        /* Optional transient trim */
         size_t start = 0, stop = nout;
         if (do_trim){
             size_t head = (size_t)(2 * SPAN);
@@ -161,22 +192,34 @@ int main(int argc, char **argv){
         }
         size_t valid = (stop > start) ? (stop - start) : 0;
 
+        /* Write output */
         FILE *fo = fopen(out_path, "wb");
-        if (!fo){ perror("open out"); free(yIQ); pfbcs_free(cs); free(xIQ); return 1; }
+        if (!fo){ perror("open out"); free(yIQ); pfbcs_free(cs); fll_be_free(fll); free(xIQ); return 1; }
         size_t wr = fwrite(&yIQ[2*start], sizeof(float), 2*valid, fo);
         fclose(fo);
         if (wr != 2*valid){ fprintf(stderr,"short write: %zu/%zu floats\n", wr, 2*valid); }
 
         if (!quiet){
             printf("Clock sync done. In=%zu complex, Out=%zu symbols, Wrote=%zu (trim=%s, agc=%s)\n",
-                   nin_c, nout, valid, do_trim ? "yes":"no", do_agc ? "yes":"no");
+                nin_c, nout, valid, do_trim ? "yes":"no", do_agc ? "yes":"no");
         }
 
-        free(yIQ); pfbcs_free(cs); free(xIQ);
+        /* Clean up */
+        free(yIQ);
+        pfbcs_free(cs);
+        fll_be_free(fll);
+        free(xIQ);
         return 0;
     }
 
-    fprintf(stderr, "Unknown --mode '%s' (use 'tx' or 'rx')\n", mode);
+    fprintf(stderr, "Unknown --mode %s\n", mode);
     usage_tx(argv[0]); usage_rx(argv[0]);
     return 1;
 }
+
+
+
+
+    
+
+    
