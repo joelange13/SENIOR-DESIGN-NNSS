@@ -16,6 +16,9 @@
 #define PREAMBLE_BYTES 8u
 #define PREAMBLE_BITS  (PREAMBLE_BYTES * 8u)
 
+/* -------- RX build-time flags -------- */
+
+
 /* -------- Packet (TX) -------- */
 typedef struct{
     uint8_t  preamble[8];
@@ -81,6 +84,65 @@ size_t manchester_decode_after_offset(const bool *in, size_t n, size_t offset, b
 /* CLI helpers (shared) */
 bool        flag_present(int argc, char **argv, const char *flag);
 const char* get_opt(int argc, char **argv, const char *key, const char *defv);
+
+/* ===================== FLL Band-Edge ===================== */
+/* Opaque handle */
+typedef struct FLLBandEdge FLLBandEdge;
+
+/* Create a band-edge FLL.
+ * alpha   : RRC rolloff (0..1)
+ * sps     : samples per symbol
+ * span    : RRC span in symbols (FIR length ~= span*sps+1, clamped to >=201)
+ * be_frac : 1.0 = place filters at the theoretical band-edges;
+ *           <1.0 pulls them slightly inward (e.g., 0.95)
+ * loop_bw : normalized loop BW per-sample (heuristic mapping to Kp/Ki)
+ * damping : currently unused in mapping (reserved)
+ * pwr_beta: single-pole IIR for power smoothing (0..1), e.g., 0.0015
+ * verbose : nonzero -> prints settings on create
+ */
+FLLBandEdge* fll_be_create(float alpha, int sps, int span,
+                           float be_frac, double loop_bw, double damping,
+                           double pwr_beta, int verbose);
+
+/* Process IQ (I/Q interleaved floats); writes frequency-corrected IQ.
+ * Returns number of complex samples written (== nin_complex).
+ */
+size_t       fll_be_process(FLLBandEdge *fll,
+                            const float *xIQ, size_t nin_complex,
+                            float *yIQ);
+
+/* Destroy */
+void         fll_be_free(FLLBandEdge *fll);
+
+/* Frequency getters:
+ * cycles/sample and rad/sample (set Hz = cps * Fs separately if desired).
+ */
+double       fll_be_get_freq_cps(const FLLBandEdge *fll);
+double       fll_be_get_freq_rad(const FLLBandEdge *fll);
+
+/* ===================== Costas Loop (BPSK, DD) ===================== */
+typedef struct CostasBPSK CostasBPSK;
+
+/* loop_bw: normalized per-sample (post-PFB, ~1 sample/symbol)
+   damping: typical 0.707
+   agc_beta: small power smoother (e.g., 1e-3) for internal RMS tracking
+   verbose: print settings once
+*/
+CostasBPSK* costas_bpsk_create(double loop_bw, double damping, double agc_beta, int verbose);
+
+/* Process nin complex samples (I/Q interleaved) -> derotated output in yIQ.
+   Returns nin (same length). */
+size_t      costas_bpsk_process(CostasBPSK *c,
+                                const float *xIQ, size_t nin_complex,
+                                float *yIQ);
+
+/* Destroy */
+void        costas_bpsk_free(CostasBPSK *c);
+
+/* Inspectors */
+double      costas_bpsk_get_phase_rad(const CostasBPSK *c);   /* current NCO phase */
+double      costas_bpsk_get_freq_cps(const CostasBPSK *c);    /* cycles/sample */
+
 
 
 #endif /* API_H */

@@ -21,14 +21,20 @@ add_library(sdr_core
   src/tx/manchester_encode_after_offset.c
   src/tx/debugPrints.c
   src/tx/write_cf32.c
-  # RX (new)
+  # RX 
   src/rx/agc_create.c
   src/rx/agc_free.c
   src/rx/agc_bootstrap.c
   src/rx/agc_apply_inplace.c
+  src/rx/fll_be_create.c
+  src/rx/fll_be_process.c
+  src/rx/fll_be_free.c
   src/rx/pfbcs_create.c
   src/rx/pfbcs_free.c
   src/rx/pfbcs_process.c
+  src/rx/costas_bpsk_create.c
+  src/rx/costas_bpsk_process.c
+  src/rx/costas_bpsk_free.c
   src/rx/descramble_self_sync_after_offset.c
   src/rx/manchester_decode_after_offset.c
   src/rx/flag_present.c
